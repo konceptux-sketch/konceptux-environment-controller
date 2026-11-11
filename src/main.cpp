@@ -6,6 +6,15 @@
 
 // ===== Hardware =====
 
+
+constexpr uint8_t BUTTON_PIN = 27;
+constexpr uint8_t BUTTON_RELAY = 1;
+constexpr uint32_t DEBOUNCE_MS = 50;
+
+bool buttonStableState = HIGH;
+bool buttonLastReading = HIGH;
+uint32_t buttonLastChange = 0;
+
 constexpr uint8_t DATA_PIN  = 14;
 constexpr uint8_t CLOCK_PIN = 13;
 constexpr uint8_t LATCH_PIN = 12;
@@ -50,6 +59,37 @@ bool setRelay(uint8_t channel, bool on)
                   channel, on ? "ON" : "OFF");
 
     return true;
+}
+
+void handleButton()
+{
+    bool reading = digitalRead(BUTTON_PIN);
+
+    if (reading != buttonLastReading)
+    {
+        buttonLastChange = millis();
+        buttonLastReading = reading;
+    }
+
+    if ((uint32_t)(millis() - buttonLastChange)
+            >= DEBOUNCE_MS &&
+        reading != buttonStableState)
+    {
+        buttonStableState = reading;
+
+        // Toggle once per press, not on release
+        if (buttonStableState == LOW)
+        {
+            bool currentlyOn =
+                (relayState & 0x0001) != 0;
+
+            setRelay(BUTTON_RELAY, !currentlyOn);
+
+            Serial.println(
+                "Physical button: Relay 1 toggled"
+            );
+        }
+    }
 }
 
 void setAllRelays(bool on)
@@ -565,6 +605,12 @@ void setup()
 
     digitalWrite(OE_PIN, LOW);
 
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+    buttonStableState = digitalRead(BUTTON_PIN);
+    buttonLastReading = buttonStableState;
+    buttonLastChange = millis();
+
     Serial.println("\nKonceptux Relay16");
 
     WiFi.mode(WIFI_STA);
@@ -602,6 +648,9 @@ void setup()
 
 void loop()
 {
+
+    handleButton();
+
     if (WiFi.status() == WL_CONNECTED)
     {
         server.handleClient();
