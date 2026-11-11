@@ -1,8 +1,10 @@
 
 #include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include "wifi_secrets.h"
 
-// Konceptux ESP32 Relay Board X16
-// Two daisy-chained 74HC595 shift registers
+// ===== Hardware =====
 
 constexpr uint8_t DATA_PIN  = 14;
 constexpr uint8_t CLOCK_PIN = 13;
@@ -12,9 +14,11 @@ constexpr uint8_t OE_PIN    = 5;
 constexpr uint8_t RELAY_COUNT = 16;
 
 uint16_t relayState = 0;
+WebServer server(80);
 String serialBuffer;
 
-// Update both 74HC595 shift registers
+// ===== Relay driver =====
+
 void updateRelays()
 {
     digitalWrite(LATCH_PIN, LOW);
@@ -28,16 +32,12 @@ void updateRelays()
     digitalWrite(LATCH_PIN, HIGH);
 }
 
-// Set individual relay (1-16)
-void setRelay(uint8_t relay, bool on)
+bool setRelay(uint8_t channel, bool on)
 {
-    if (relay < 1 || relay > RELAY_COUNT)
-    {
-        Serial.println("ERROR: Relay must be 1-16");
-        return;
-    }
+    if (channel < 1 || channel > 16)
+        return false;
 
-    uint16_t mask = (uint16_t)1 << (relay - 1);
+    uint16_t mask = (uint16_t)1 << (channel - 1);
 
     if (on)
         relayState |= mask;
@@ -47,156 +47,508 @@ void setRelay(uint8_t relay, bool on)
     updateRelays();
 
     Serial.printf("Relay %02u: %s\n",
-                  relay, on ? "ON" : "OFF");
+                  channel, on ? "ON" : "OFF");
+
+    return true;
 }
 
-// Set all relays
 void setAllRelays(bool on)
 {
     relayState = on ? 0xFFFF : 0x0000;
-
     updateRelays();
 
-    Serial.println(on ?
-        "All relays ON" :
-        "All relays OFF");
+    Serial.println(on ? "All relays ON" : "All relays OFF");
 }
 
-// Display relay states
-void printStatus()
+// ===== JSON status =====
+
+String statusJson()
 {
-    Serial.println("\n--- RELAY STATUS ---");
+    String json = "{\"online\":true,\"relays\":[";
 
-    for (uint8_t i = 1; i <= RELAY_COUNT; i++)
+    for (uint8_t i = 0; i < 16; i++)
     {
-        bool on = relayState & ((uint16_t)1 << (i - 1));
+        if (i > 0) json += ",";
 
-        Serial.printf("Relay %02u: %s\n",
-                      i, on ? "ON" : "OFF");
+        json += (relayState & ((uint16_t)1 << i))
+                    ? "true" : "false";
     }
 
-    Serial.println("--------------------");
+    json += "]}";
+    return json;
 }
 
-// Sequential test
-void testRelays()
+void sendJson(int code, const String& json)
 {
-    Serial.println("Starting relay test...");
-
-    setAllRelays(false);
-
-    for (uint8_t i = 1; i <= RELAY_COUNT; i++)
-    {
-        setRelay(i, true);
-        delay(400);
-        setRelay(i, false);
-        delay(200);
-    }
-
-    Serial.println("Relay test completed.");
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(code, "application/json", json);
 }
 
-// Help menu
-void printHelp()
-{
-    Serial.println("\n=== KONCEPTUX RELAY16 ===");
-    Serial.println("ON 1       - Turn ON relay 1");
-    Serial.println("OFF 1      - Turn OFF relay 1");
-    Serial.println("ON 16      - Turn ON relay 16");
-    Serial.println("OFF 16     - Turn OFF relay 16");
-    Serial.println("ON ALL     - Turn ON all relays");
-    Serial.println("OFF ALL    - Turn OFF all relays");
-    Serial.println("STATUS     - Show relay states");
-    Serial.println("TEST       - Sequential test");
-    Serial.println("HELP       - Show commands");
-    Serial.println("=========================");
+// ===== Web dashboard =====
+
+const char DASHBOARD[] PROGMEM = R"HTML(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport"
+      content="width=device-width, initial-scale=1">
+
+<title>Konceptux Relay16</title>
+
+<style>
+:root {
+    color-scheme: dark;
+    font-family: Arial, sans-serif;
 }
 
-// Process command from Serial Monitor
-void processCommand(String command)
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    background: #101827;
+    color: #f1f5f9;
+}
+
+.container {
+    max-width: 900px;
+    margin: auto;
+    padding: 24px 16px;
+}
+
+header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 25px;
+}
+
+h1 {
+    margin: 0;
+    font-size: 25px;
+}
+
+.subtitle {
+    color: #94a3b8;
+    margin-top: 6px;
+}
+
+.status {
+    font-size: 13px;
+    color: #fbbf24;
+}
+
+.stats {
+    background: #1e293b;
+    border-radius: 14px;
+    padding: 20px;
+    margin-bottom: 20px;
+}
+
+.count {
+    font-size: 32px;
+    font-weight: bold;
+}
+
+.grid {
+    display: grid;
+    grid-template-columns:
+        repeat(4, minmax(0, 1fr));
+    gap: 12px;
+}
+
+.relay {
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 12px;
+    padding: 18px 10px;
+    text-align: center;
+}
+
+.relay.active {
+    border-color: #22c55e;
+    background: #173c35;
+}
+
+.relay h3 {
+    font-size: 15px;
+    margin: 0 0 12px;
+}
+
+.relay button {
+    border: none;
+    border-radius: 8px;
+    padding: 12px 16px;
+    font-weight: bold;
+    cursor: pointer;
+    background: #475569;
+    color: white;
+    width: 100%;
+}
+
+.relay.active button {
+    background: #22c55e;
+    color: #052e16;
+}
+
+button:disabled {
+    opacity: 0.5;
+    cursor: wait;
+}
+
+.actions {
+    display: flex;
+    gap: 12px;
+    margin-top: 20px;
+}
+
+.actions button {
+    flex: 1;
+    padding: 15px;
+    border: none;
+    border-radius: 10px;
+    cursor: pointer;
+    font-weight: bold;
+}
+
+.alloff {
+    background: #475569;
+    color: white;
+}
+
+.allon {
+    background: #2563eb;
+    color: white;
+}
+
+.message {
+    min-height: 22px;
+    color: #fbbf24;
+    margin-top: 15px;
+}
+
+footer {
+    text-align: center;
+    margin-top: 30px;
+    color: #64748b;
+    font-size: 12px;
+}
+
+@media(max-width:600px) {
+    .grid {
+        grid-template-columns:
+            repeat(2, minmax(0, 1fr));
+    }
+
+    h1 {
+        font-size: 21px;
+    }
+}
+</style>
+</head>
+
+<body>
+<div class="container">
+
+<header>
+    <div>
+        <h1>KONCEPTUX</h1>
+        <div class="subtitle">
+            ESP32 Smart Relay Controller
+        </div>
+    </div>
+    <div class="status" id="connection">
+        Connecting...
+    </div>
+</header>
+
+<div class="stats">
+    <div>Active relays</div>
+    <div class="count" id="count">0 / 16</div>
+</div>
+
+<div class="grid" id="relayGrid"></div>
+
+<div class="actions">
+    <button class="alloff"
+            onclick="setAll(false)">
+        ALL OFF
+    </button>
+
+    <button class="allon"
+            onclick="setAll(true)">
+        ALL ON
+    </button>
+</div>
+
+<div class="message" id="message"></div>
+
+<footer>
+    Konceptux Technologies | ESP32 Relay16
+</footer>
+
+</div>
+
+<script>
+let states = Array(16).fill(false);
+let busy = false;
+
+const grid = document.getElementById("relayGrid");
+const message = document.getElementById("message");
+const connection = document.getElementById("connection");
+
+function render() {
+    grid.replaceChildren();
+
+    states.forEach((on, index) => {
+        const card = document.createElement("div");
+        card.className = "relay" + (on ? " active" : "");
+
+        const heading = document.createElement("h3");
+        heading.textContent =
+            "Relay " + String(index + 1).padStart(2, "0");
+
+        const button = document.createElement("button");
+        button.textContent = on ? "ON" : "OFF";
+        button.disabled = busy;
+        button.addEventListener("click", () => {
+            setRelay(index + 1, !on);
+        });
+
+        card.append(heading, button);
+        grid.appendChild(card);
+    });
+
+    const active = states.filter(Boolean).length;
+    document.getElementById("count").textContent =
+        active + " / 16";
+
+    document.querySelectorAll(".actions button")
+        .forEach(button => button.disabled = busy);
+}
+
+async function request(url, options) {
+    const response = await fetch(url, {
+        cache: "no-store",
+        ...options
+    });
+
+    if (!response.ok) {
+        throw new Error("HTTP " + response.status);
+    }
+
+    return response.json();
+}
+
+async function refresh() {
+    if (busy) return;
+
+    try {
+        const data = await request("/api/status");
+
+        states = data.relays;
+        connection.textContent = "● Connected";
+        connection.style.color = "#22c55e";
+        message.textContent = "";
+        render();
+    } catch (error) {
+        connection.textContent = "● Disconnected";
+        connection.style.color = "#f87171";
+        message.textContent =
+            "Unable to communicate with ESP32.";
+    }
+}
+
+async function setRelay(channel, on) {
+    if (busy) return;
+    busy = true;
+    render();
+
+    try {
+        const data = await request(
+            "/api/relay?channel=" + channel +
+            "&state=" + (on ? 1 : 0),
+            { method: "POST" }
+        );
+
+        states = data.relays;
+        message.textContent = "";
+    } catch (error) {
+        message.textContent =
+            "Relay command failed: " + error.message;
+    } finally {
+        busy = false;
+        render();
+        refresh();
+    }
+}
+
+async function setAll(on) {
+    if (busy) return;
+    busy = true;
+    render();
+
+    try {
+        const data = await request(
+            "/api/all?state=" + (on ? 1 : 0),
+            { method: "POST" }
+        );
+
+        states = data.relays;
+        message.textContent = "";
+    } catch (error) {
+        message.textContent =
+            "Command failed: " + error.message;
+    } finally {
+        busy = false;
+        render();
+        refresh();
+    }
+}
+
+render();
+refresh();
+setInterval(refresh, 1500);
+</script>
+</body>
+</html>
+)HTML";
+
+// ===== HTTP handlers =====
+
+void handleRelay()
 {
-    command.trim();
-    command.toUpperCase();
-
-    if (command == "HELP")
+    if (!server.hasArg("channel") ||
+        !server.hasArg("state"))
     {
-        printHelp();
+        sendJson(400, "{\"error\":\"Missing parameters\"}");
         return;
     }
 
-    if (command == "STATUS")
+    String channelText = server.arg("channel");
+    String stateText = server.arg("state");
+
+    if (channelText.isEmpty() ||
+        channelText.length() > 2 ||
+        (stateText != "0" && stateText != "1"))
     {
-        printStatus();
+        sendJson(400, "{\"error\":\"Invalid parameters\"}");
         return;
     }
 
-    if (command == "TEST")
+    for (char c : channelText)
     {
-        testRelays();
-        return;
-    }
-
-    if (command == "ON ALL")
-    {
-        setAllRelays(true);
-        return;
-    }
-
-    if (command == "OFF ALL")
-    {
-        setAllRelays(false);
-        return;
-    }
-
-    int spaceIndex = command.indexOf(' ');
-
-    if (spaceIndex > 0)
-    {
-        String action = command.substring(0, spaceIndex);
-        String relayStr = command.substring(spaceIndex + 1);
-        relayStr.trim();
-
-        if (action == "ON" || action == "OFF")
+        if (c < '0' || c > '9')
         {
-            // Require a numeric channel, not partial text
-            if (relayStr.length() == 0)
-            {
-                Serial.println("ERROR: Missing relay number");
-                return;
-            }
-
-            for (size_t i = 0; i < relayStr.length(); i++)
-            {
-                if (!isDigit(relayStr[i]))
-                {
-                    Serial.println("ERROR: Invalid relay number");
-                    return;
-                }
-            }
-
-            int relay = relayStr.toInt();
-
-            if (relay < 1 || relay > RELAY_COUNT)
-            {
-                Serial.println("ERROR: Relay must be 1-16");
-                return;
-            }
-
-            setRelay((uint8_t)relay, action == "ON");
+            sendJson(400, "{\"error\":\"Invalid channel\"}");
             return;
         }
     }
 
-    Serial.println("Unknown command. Type HELP.");
+    int channel = channelText.toInt();
+
+    if (!setRelay(channel, stateText == "1"))
+    {
+        sendJson(400, "{\"error\":\"Channel must be 1-16\"}");
+        return;
+    }
+
+    sendJson(200, statusJson());
 }
+
+void handleAll()
+{
+    if (!server.hasArg("state") ||
+        (server.arg("state") != "0" &&
+         server.arg("state") != "1"))
+    {
+        sendJson(400, "{\"error\":\"Invalid state\"}");
+        return;
+    }
+
+    setAllRelays(server.arg("state") == "1");
+    sendJson(200, statusJson());
+}
+
+void setupWebServer()
+{
+    server.on("/", HTTP_GET, []() {
+        server.send_P(200, "text/html", DASHBOARD);
+    });
+
+    server.on("/api/status", HTTP_GET, []() {
+        sendJson(200, statusJson());
+    });
+
+    server.on("/api/relay", HTTP_POST, handleRelay);
+    server.on("/api/all", HTTP_POST, handleAll);
+
+    server.onNotFound([]() {
+        sendJson(404, "{\"error\":\"Not found\"}");
+    });
+
+    server.begin();
+    Serial.println("HTTP server started");
+}
+
+// ===== Serial commands =====
+
+void processSerial(String command)
+{
+    command.trim();
+    command.toUpperCase();
+
+    if (command == "STATUS")
+    {
+        Serial.println(statusJson());
+    }
+    else if (command == "ON ALL")
+    {
+        setAllRelays(true);
+    }
+    else if (command == "OFF ALL")
+    {
+        setAllRelays(false);
+    }
+    else if (command == "HELP")
+    {
+        Serial.println(
+            "ON 1-16 | OFF 1-16 | ON ALL | OFF ALL | STATUS"
+        );
+    }
+    else if (command.startsWith("ON ") ||
+             command.startsWith("OFF "))
+    {
+        bool on = command.startsWith("ON ");
+        String number = command.substring(on ? 3 : 4);
+        number.trim();
+
+        bool valid = !number.isEmpty() &&
+                     number.length() <= 2;
+
+        for (char c : number)
+            if (c < '0' || c > '9')
+                valid = false;
+
+        if (!valid || !setRelay(number.toInt(), on))
+            Serial.println("Invalid relay number");
+    }
+    else
+    {
+        Serial.println("Unknown command. Type HELP.");
+    }
+}
+
+// ===== Setup =====
 
 void setup()
 {
     Serial.begin(115200);
-    Serial.setTimeout(50);
-    serialBuffer.reserve(64);
 
-    // Disable shift-register outputs during setup
+    // Disable outputs during initialization
     digitalWrite(OE_PIN, HIGH);
     pinMode(OE_PIN, OUTPUT);
 
@@ -208,29 +560,62 @@ void setup()
     digitalWrite(CLOCK_PIN, LOW);
     digitalWrite(LATCH_PIN, LOW);
 
-    relayState = 0x0000;
+    relayState = 0;
     updateRelays();
 
-    // Enable outputs after initializing relay state
     digitalWrite(OE_PIN, LOW);
 
-    delay(500);
+    Serial.println("\nKonceptux Relay16");
 
-    Serial.println("\nKonceptux Relay16 Ready!");
-    printHelp();
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    Serial.print("Connecting to Wi-Fi");
+
+    unsigned long start = millis();
+
+    while (WiFi.status() != WL_CONNECTED &&
+           millis() - start < 20000)
+    {
+        delay(500);
+        Serial.print(".");
+    }
+
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        Serial.println("\nWi-Fi connected");
+        Serial.print("IP address: ");
+        Serial.println(WiFi.localIP());
+
+        setupWebServer();
+    }
+    else
+    {
+        Serial.println("\nWi-Fi connection failed");
+        Serial.println("Serial control remains available");
+    }
+
+    Serial.println("Type HELP for serial commands");
 }
+
+// ===== Main loop =====
 
 void loop()
 {
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        server.handleClient();
+    }
+
     while (Serial.available())
     {
         char c = (char)Serial.read();
 
         if (c == '\n' || c == '\r')
         {
-            if (serialBuffer.length() > 0)
+            if (!serialBuffer.isEmpty())
             {
-                processCommand(serialBuffer);
+                processSerial(serialBuffer);
                 serialBuffer = "";
             }
         }
@@ -241,7 +626,7 @@ void loop()
         else
         {
             serialBuffer = "";
-            Serial.println("ERROR: Command too long");
+            Serial.println("Command too long");
         }
     }
 }
