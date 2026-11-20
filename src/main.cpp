@@ -3,6 +3,20 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include "wifi_secrets.h"
+#include <Wire.h>
+#include <Adafruit_SHT4x.h>
+#include <math.h>
+
+Adafruit_SHT4x sht4;
+
+bool shtReady = false;
+bool sensorValid = false;
+
+float temperatureC = NAN;
+float humidityRH = NAN;
+
+uint32_t lastSensorRead = 0;
+constexpr uint32_t SENSOR_INTERVAL_MS = 2000;
 
 // ===== Hardware =====
 
@@ -25,6 +39,55 @@ constexpr uint8_t RELAY_COUNT = 16;
 uint16_t relayState = 0;
 WebServer server(80);
 String serialBuffer;
+
+
+void initSensor()
+{
+    Wire.begin(22, 25);  // SDA, SCL
+
+    shtReady = sht4.begin(&Wire);
+
+    if (shtReady)
+    {
+        sht4.setPrecision(SHT4X_HIGH_PRECISION);
+        sht4.setHeater(SHT4X_NO_HEATER);
+        Serial.println("SHT41 initialized");
+    }
+    else
+    {
+        Serial.println("SHT41 not detected");
+    }
+}
+
+void updateSensor()
+{
+    if (!shtReady) return;
+
+    if (millis() - lastSensorRead < SENSOR_INTERVAL_MS)
+        return;
+
+    lastSensorRead = millis();
+
+    sensors_event_t humidity;
+    sensors_event_t temperature;
+
+    if (sht4.getEvent(&humidity, &temperature))
+    {
+        temperatureC = temperature.temperature;
+        humidityRH = humidity.relative_humidity;
+        sensorValid = true;
+
+        Serial.printf(
+            "Temperature: %.2f C | Humidity: %.2f %%\n",
+            temperatureC, humidityRH
+        );
+    }
+    else
+    {
+        sensorValid = false;
+        Serial.println("SHT41 reading failed");
+    }
+}
 
 // ===== Relay driver =====
 
@@ -114,9 +177,23 @@ String statusJson()
                     ? "true" : "false";
     }
 
-    json += "]}";
+    json += "],\"sensor\":{";
+    json += "\"valid\":";
+    json += sensorValid ? "true" : "false";
+
+    json += ",\"temperature\":";
+    json += sensorValid
+        ? String(temperatureC, 2) : "null";
+
+    json += ",\"humidity\":";
+    json += sensorValid
+        ? String(humidityRH, 2) : "null";
+
+    json += "}}";
+
     return json;
 }
+
 
 void sendJson(int code, const String& json)
 {
@@ -287,6 +364,29 @@ footer {
         font-size: 21px;
     }
 }
+
+.sensor-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 12px;
+    margin-bottom: 20px;
+}
+
+.sensor-card {
+    background: #1e293b;
+    border-radius: 12px;
+    padding: 20px;
+}
+
+.sensor-card div {
+    color: #94a3b8;
+    margin-bottom: 10px;
+}
+
+.sensor-card strong {
+    font-size: 26px;
+}
+
 </style>
 </head>
 
@@ -308,6 +408,18 @@ footer {
 <div class="stats">
     <div>Active relays</div>
     <div class="count" id="count">0 / 16</div>
+</div>
+
+<div class="sensor-grid">
+    <div class="sensor-card">
+        <div>Temperature</div>
+        <strong id="temperature">-- °C</strong>
+    </div>
+
+    <div class="sensor-card">
+        <div>Humidity</div>
+        <strong id="humidity">-- %</strong>
+    </div>
 </div>
 
 <div class="grid" id="relayGrid"></div>
@@ -390,6 +502,19 @@ async function refresh() {
         const data = await request("/api/status");
 
         states = data.relays;
+
+        const sensor = data.sensor;
+
+        document.getElementById("temperature").textContent =
+          sensor?.valid
+        ? sensor.temperature.toFixed(1) + " °C"
+        : "-- °C";
+
+        document.getElementById("humidity").textContent =
+          sensor?.valid
+        ? sensor.humidity.toFixed(1) + " %"
+        : "-- %";
+
         connection.textContent = "● Connected";
         connection.style.color = "#22c55e";
         message.textContent = "";
@@ -611,6 +736,7 @@ void setup()
     buttonLastReading = buttonStableState;
     buttonLastChange = millis();
 
+    initSensor();
     Serial.println("\nKonceptux Relay16");
 
     WiFi.mode(WIFI_STA);
@@ -650,7 +776,7 @@ void loop()
 {
 
     handleButton();
-
+    updateSensor();
     if (WiFi.status() == WL_CONNECTED)
     {
         server.handleClient();
