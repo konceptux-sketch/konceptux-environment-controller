@@ -1,4 +1,3 @@
-
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
@@ -40,6 +39,22 @@ uint16_t relayState = 0;
 WebServer server(80);
 String serialBuffer;
 
+enum class ControlMode {
+    MANUAL,
+    AUTOMATIC
+};
+
+ControlMode controlMode = ControlMode::MANUAL;
+
+float coolingSetpoint = 25.0f;
+float coolingHysteresis = 1.0f;
+
+constexpr uint8_t CONTROL_RELAY = 1;
+constexpr uint32_t SENSOR_STALE_MS = 6000;
+
+uint32_t lastValidSensorRead = 0;
+
+
 
 void initSensor()
 {
@@ -76,7 +91,7 @@ void updateSensor()
         temperatureC = temperature.temperature;
         humidityRH = humidity.relative_humidity;
         sensorValid = true;
-
+        lastValidSensorRead = millis();
         Serial.printf(
             "Temperature: %.2f C | Humidity: %.2f %%\n",
             temperatureC, humidityRH
@@ -124,6 +139,34 @@ bool setRelay(uint8_t channel, bool on)
     return true;
 }
 
+
+
+void updateAutomaticControl()
+{
+    if (controlMode != ControlMode::AUTOMATIC)
+        return;
+
+    bool fresh = sensorValid &&
+        isfinite(temperatureC) &&
+        (millis() - lastValidSensorRead <= SENSOR_STALE_MS);
+
+    bool relayOn = (relayState & 0x0001) != 0;
+
+    if (!fresh)
+    {
+        if (relayOn)
+            setRelay(CONTROL_RELAY, false);
+        return;
+    }
+
+    if (!relayOn && temperatureC >= coolingSetpoint)
+        setRelay(CONTROL_RELAY, true);
+    else if (relayOn &&
+             temperatureC <= coolingSetpoint - coolingHysteresis)
+        setRelay(CONTROL_RELAY, false);
+}
+
+
 void handleButton()
 {
     bool reading = digitalRead(BUTTON_PIN);
@@ -141,7 +184,8 @@ void handleButton()
         buttonStableState = reading;
 
         // Toggle once per press, not on release
-        if (buttonStableState == LOW)
+       if (buttonStableState == LOW &&
+            controlMode == ControlMode::MANUAL)
         {
             bool currentlyOn =
                 (relayState & 0x0001) != 0;
@@ -422,6 +466,26 @@ footer {
     </div>
 </div>
 
+<div class="sensor-card" style="margin-bottom:20px">
+  <h3>Temperature Automation</h3>
+
+  <label>Mode</label>
+  <select id="controlMode">
+    <option value="manual">Manual</option>
+    <option value="automatic">Automatic</option>
+  </select>
+
+  <p>ON temperature (°C)</p>
+  <input id="setpoint" type="number"
+         min="15" max="40" step="0.5" value="25">
+
+  <p>Hysteresis (°C)</p>
+  <input id="hysteresis" type="number"
+         min="0.5" max="5" step="0.5" value="1">
+
+  <button onclick="saveControl()">Apply settings</button>
+</div>
+
 <div class="grid" id="relayGrid"></div>
 
 <div class="actions">
@@ -452,6 +516,57 @@ const grid = document.getElementById("relayGrid");
 const message = document.getElementById("message");
 const connection = document.getElementById("connection");
 
+let currentMode = "manual";
+
+async function loadControl() {
+    const data = await request("/api/control");
+
+    currentMode = data.mode;
+
+    document.getElementById("controlMode").value =
+        data.mode;
+
+    document.getElementById("setpoint").value =
+        data.setpoint;
+
+    document.getElementById("hysteresis").value =
+        data.hysteresis;
+}
+
+async function saveControl() {
+    const mode =
+        document.getElementById("controlMode").value;
+
+    const setpoint =
+        document.getElementById("setpoint").value;
+
+    const hysteresis =
+        document.getElementById("hysteresis").value;
+
+    const params = new URLSearchParams({
+        mode, setpoint, hysteresis
+    });
+
+    try {
+        await request("/api/control", {
+            method: "POST",
+            headers: {
+                "Content-Type":
+                    "application/x-www-form-urlencoded"
+            },
+            body: params.toString()
+        });
+
+        await loadControl();
+        await refresh();
+    } catch (error) {
+        message.textContent =
+            "Unable to update control settings.";
+    }
+}
+
+loadControl().catch(console.error);
+
 function render() {
     grid.replaceChildren();
 
@@ -465,7 +580,7 @@ function render() {
 
         const button = document.createElement("button");
         button.textContent = on ? "ON" : "OFF";
-        button.disabled = busy;
+        button.disabled = busy || (index === 0 && currentMode === "automatic");
         button.addEventListener("click", () => {
             setRelay(index + 1, !on);
         });
@@ -583,7 +698,11 @@ setInterval(refresh, 1500);
 )HTML";
 
 // ===== HTTP handlers =====
-
+bool manualRelayAllowed(uint8_t channel)
+{
+    return channel != CONTROL_RELAY ||
+           controlMode == ControlMode::MANUAL;
+}
 void handleRelay()
 {
     if (!server.hasArg("channel") ||
@@ -613,7 +732,15 @@ void handleRelay()
         }
     }
 
+    
     int channel = channelText.toInt();
+
+    if (!manualRelayAllowed(channel))
+    {
+      sendJson(409,
+        "{\"error\":\"Relay 1 is in automatic mode\"}");
+    return;
+    }
 
     if (!setRelay(channel, stateText == "1"))
     {
@@ -626,6 +753,12 @@ void handleRelay()
 
 void handleAll()
 {
+    if (controlMode == ControlMode::AUTOMATIC)
+    {
+        sendJson(409,
+        "{\"error\":\"All-relay commands unavailable in automatic mode\"}");
+        return;
+    }
     if (!server.hasArg("state") ||
         (server.arg("state") != "0" &&
          server.arg("state") != "1"))
@@ -636,6 +769,85 @@ void handleAll()
 
     setAllRelays(server.arg("state") == "1");
     sendJson(200, statusJson());
+}
+
+String controlJson()
+{
+    return String("{\"mode\":\"") +
+        (controlMode == ControlMode::MANUAL
+            ? "manual" : "automatic") +
+        "\",\"setpoint\":" + String(coolingSetpoint, 1) +
+        ",\"hysteresis\":" + String(coolingHysteresis, 1) +
+        "}";
+}
+
+void handleControl()
+{
+    if (server.method() == HTTP_GET)
+    {
+        sendJson(200, controlJson());
+        return;
+    }
+
+    String mode = server.arg("mode");
+    String setpointText = server.arg("setpoint");
+    String hysteresisText = server.arg("hysteresis");
+
+    if (mode != "manual" && mode != "automatic")
+    {
+        sendJson(400, "{\"error\":\"Invalid mode\"}");
+        return;
+    }
+
+    if (setpointText.isEmpty() || hysteresisText.isEmpty())
+    {
+        sendJson(400, "{\"error\":\"Missing settings\"}");
+        return;
+    }
+
+    // Require a complete numeric value, not partial text.
+    auto validNumber = [](const String& s) {
+        if (s.isEmpty() || s.length() > 12) return false;
+        bool dot = false;
+        for (size_t i = 0; i < s.length(); ++i) {
+            char c = s[i];
+            if (c == '.' && !dot) {
+                dot = true;
+            } else if (c == '-' && i == 0) {
+                continue;
+            } else if (c < '0' || c > '9') {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    if (!validNumber(setpointText) ||
+        !validNumber(hysteresisText))
+    {
+        sendJson(400, "{\"error\":\"Invalid numbers\"}");
+        return;
+    }
+
+    float setpoint = setpointText.toFloat();
+    float hysteresis = hysteresisText.toFloat();
+
+    if (!isfinite(setpoint) || !isfinite(hysteresis) ||
+        setpoint < 15.0f || setpoint > 40.0f ||
+        hysteresis < 0.5f || hysteresis > 5.0f)
+    {
+        sendJson(400, "{\"error\":\"Settings out of range\"}");
+        return;
+    }
+
+    coolingSetpoint = setpoint;
+    coolingHysteresis = hysteresis;
+    controlMode = mode == "automatic"
+        ? ControlMode::AUTOMATIC
+        : ControlMode::MANUAL;
+
+    updateAutomaticControl();
+    sendJson(200, controlJson());
 }
 
 void setupWebServer()
@@ -650,7 +862,8 @@ void setupWebServer()
 
     server.on("/api/relay", HTTP_POST, handleRelay);
     server.on("/api/all", HTTP_POST, handleAll);
-
+    server.on("/api/control", HTTP_GET, handleControl);
+    server.on("/api/control", HTTP_POST, handleControl);
     server.onNotFound([]() {
         sendJson(404, "{\"error\":\"Not found\"}");
     });
@@ -777,6 +990,7 @@ void loop()
 
     handleButton();
     updateSensor();
+    updateAutomaticControl();
     if (WiFi.status() == WL_CONNECTED)
     {
         server.handleClient();
