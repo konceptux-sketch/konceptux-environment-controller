@@ -5,6 +5,22 @@
 #include <Wire.h>
 #include <Adafruit_SHT4x.h>
 #include <math.h>
+#include <U8g2lib.h>
+
+U8G2_SSD1306_64X48_ER_F_HW_I2C oled(
+    U8G2_R0,
+    U8X8_PIN_NONE
+);
+
+bool oledReady = false;
+
+uint8_t oledPage = 0;
+uint32_t lastOledPageChange = 0;
+uint32_t lastOledRefresh = 0;
+
+constexpr uint32_t OLED_PAGE_MS = 3000;
+constexpr uint32_t OLED_REFRESH_MS = 500;
+
 
 Adafruit_SHT4x sht4;
 
@@ -55,6 +71,23 @@ constexpr uint32_t SENSOR_STALE_MS = 6000;
 uint32_t lastValidSensorRead = 0;
 
 
+void initOled()
+{
+    // Wire.begin(22, 25) already runs in initSensor().
+    // Do not initialize a second I2C bus.
+
+    oledReady = oled.begin();
+
+    if (oledReady)
+    {
+        oled.setContrast(180);
+        Serial.println("OLED initialized");
+    }
+    else
+    {
+        Serial.println("OLED initialization failed");
+    }
+}
 
 void initSensor()
 {
@@ -920,6 +953,106 @@ void processSerial(String command)
     }
 }
 
+void drawOledPage()
+{
+    if (!oledReady)
+        return;
+
+    oled.clearBuffer();
+    oled.setFont(u8g2_font_5x7_tr);
+
+    char line[24];
+
+    switch (oledPage)
+    {
+        case 0:
+            oled.drawStr(0, 8, "KONCEPTUX");
+
+            if (sensorValid && isfinite(temperatureC))
+            {
+                snprintf(line, sizeof(line),
+                         "T: %.1f C", temperatureC);
+                oled.drawStr(0, 22, line);
+
+                snprintf(line, sizeof(line),
+                         "RH: %.1f%%", humidityRH);
+                oled.drawStr(0, 34, line);
+            }
+            else
+            {
+                oled.drawStr(0, 24, "SENSOR ERR");
+            }
+            break;
+
+        case 1:
+            oled.drawStr(0, 8, "TEMP CTRL");
+
+            oled.drawStr(
+                0, 20,
+                controlMode == ControlMode::AUTOMATIC
+                    ? "AUTO" : "MANUAL"
+            );
+
+            snprintf(line, sizeof(line),
+                     "SP: %.1f C", coolingSetpoint);
+            oled.drawStr(0, 32, line);
+
+            oled.drawStr(
+                0, 44,
+                (relayState & 0x0001)
+                    ? "R1: ON" : "R1: OFF"
+            );
+            break;
+
+        case 2:
+        {
+            oled.drawStr(0, 8, "RELAYS");
+
+            uint8_t active = 0;
+            for (uint8_t i = 0; i < 16; i++)
+            {
+                if (relayState & ((uint16_t)1 << i))
+                    active++;
+            }
+
+            snprintf(line, sizeof(line),
+                     "ON: %u/16", active);
+            oled.drawStr(0, 24, line);
+
+            oled.drawStr(
+                0, 38,
+                WiFi.status() == WL_CONNECTED
+                    ? "WiFi: OK"
+                    : "WiFi: OFF"
+            );
+            break;
+        }
+    }
+
+    oled.sendBuffer();
+}
+
+
+void updateOled()
+{
+    if (!oledReady)
+        return;
+
+    uint32_t now = millis();
+
+    if (now - lastOledPageChange >= OLED_PAGE_MS)
+    {
+        lastOledPageChange = now;
+        oledPage = (oledPage + 1) % 3;
+    }
+
+    if (now - lastOledRefresh >= OLED_REFRESH_MS)
+    {
+        lastOledRefresh = now;
+        drawOledPage();
+    }
+}
+
 // ===== Setup =====
 
 void setup()
@@ -950,6 +1083,7 @@ void setup()
     buttonLastChange = millis();
 
     initSensor();
+    initOled();
     Serial.println("\nKonceptux Relay16");
 
     WiFi.mode(WIFI_STA);
@@ -991,6 +1125,7 @@ void loop()
     handleButton();
     updateSensor();
     updateAutomaticControl();
+    updateOled();
     if (WiFi.status() == WL_CONNECTED)
     {
         server.handleClient();
