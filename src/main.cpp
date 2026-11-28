@@ -6,6 +6,11 @@
 #include <Adafruit_SHT4x.h>
 #include <math.h>
 #include <U8g2lib.h>
+#include <Preferences.h>
+
+Preferences preferences;
+
+
 
 U8G2_SSD1306_64X48_ER_F_HW_I2C oled(
     U8G2_R0,
@@ -69,6 +74,147 @@ constexpr uint8_t CONTROL_RELAY = 1;
 constexpr uint32_t SENSOR_STALE_MS = 6000;
 
 uint32_t lastValidSensorRead = 0;
+
+
+constexpr uint8_t BUZZER_PIN = 16;
+
+constexpr float DEFAULT_ALARM_THRESHOLD = 25.0f;
+constexpr float MIN_ALARM_THRESHOLD = 15.0f;
+constexpr float MAX_ALARM_THRESHOLD = 60.0f;
+
+float alarmThreshold = DEFAULT_ALARM_THRESHOLD;
+
+bool alarmSensorFault = false;
+bool alarmHighTemperature = false;
+
+constexpr uint32_t ALARM_ON_MS = 150;
+constexpr uint32_t ALARM_PERIOD_MS = 2000;
+
+bool alarmActive = false;
+
+
+void loadSettings()
+{
+    if (!preferences.begin("konceptux", true))
+    {
+        Serial.println("No saved settings. Using defaults.");
+        return;
+    }
+
+    coolingSetpoint =
+        preferences.getFloat("setpoint", 25.0f);
+
+    coolingHysteresis =
+        preferences.getFloat("hyst", 1.0f);
+
+    alarmThreshold =
+        preferences.getFloat(
+            "alarmTemp", DEFAULT_ALARM_THRESHOLD);
+
+    bool automatic =
+        preferences.getBool("auto", false);
+
+    preferences.end();
+
+    // Validate restored values
+    if (!isfinite(coolingSetpoint) ||
+        coolingSetpoint < 15.0f ||
+        coolingSetpoint > 40.0f)
+    {
+        coolingSetpoint = 25.0f;
+    }
+
+    if (!isfinite(coolingHysteresis) ||
+        coolingHysteresis < 0.5f ||
+        coolingHysteresis > 5.0f)
+    {
+        coolingHysteresis = 1.0f;
+    }
+
+    if (!isfinite(alarmThreshold) ||
+        alarmThreshold < MIN_ALARM_THRESHOLD ||
+        alarmThreshold > MAX_ALARM_THRESHOLD)
+    {
+        alarmThreshold = DEFAULT_ALARM_THRESHOLD;
+    }
+
+    controlMode = automatic
+        ? ControlMode::AUTOMATIC
+        : ControlMode::MANUAL;
+
+    Serial.printf(
+        "Restored: SP=%.1f C, HYST=%.1f C, "
+        "ALARM=%.1f C, MODE=%s\n",
+        coolingSetpoint,
+        coolingHysteresis,
+        alarmThreshold,
+        automatic ? "AUTO" : "MANUAL"
+    );
+}
+
+bool saveSettings()
+{
+    if (!preferences.begin("konceptux", false))
+    {
+        Serial.println("NVS initialization failed");
+        return false;
+    }
+
+    bool success = true;
+
+    success &= preferences.putFloat(
+        "setpoint", coolingSetpoint) > 0;
+
+    success &= preferences.putFloat(
+        "hyst", coolingHysteresis) > 0;
+
+    success &= preferences.putFloat(
+        "alarmTemp", alarmThreshold) > 0;
+
+    success &= preferences.putBool(
+        "auto",
+        controlMode == ControlMode::AUTOMATIC) > 0;
+
+    preferences.end();
+
+    Serial.println(success
+        ? "Settings saved to NVS"
+        : "NVS write failed");
+
+    return success;
+}
+
+void initBuzzer()
+{
+    digitalWrite(BUZZER_PIN, LOW);
+    pinMode(BUZZER_PIN, OUTPUT);
+}
+
+void updateAlarm()
+{
+    uint32_t now = millis();
+
+    alarmSensorFault =
+        !sensorValid ||
+        !isfinite(temperatureC) ||
+        (now - lastValidSensorRead > SENSOR_STALE_MS);
+
+    alarmHighTemperature =
+        !alarmSensorFault &&
+        temperatureC >= alarmThreshold;
+
+    alarmActive =
+        alarmSensorFault || alarmHighTemperature;
+
+    bool buzzerOn =
+        alarmActive &&
+        (now % ALARM_PERIOD_MS < ALARM_ON_MS);
+
+    digitalWrite(
+        BUZZER_PIN,
+        buzzerOn ? HIGH : LOW
+    );
+}
 
 
 void initOled()
@@ -266,9 +412,25 @@ String statusJson()
     json += sensorValid
         ? String(humidityRH, 2) : "null";
 
-    json += "}}";
 
-    return json;
+json += "},\"alarm\":{";
+
+json += "\"active\":";
+json += alarmActive ? "true" : "false";
+
+json += ",\"threshold\":";
+json += String(alarmThreshold, 1);
+
+json += ",\"sensorFault\":";
+json += alarmSensorFault ? "true" : "false";
+
+json += ",\"highTemperature\":";
+json += alarmHighTemperature ? "true" : "false";
+
+json += "}}";
+
+return json;
+
 }
 
 
@@ -464,6 +626,64 @@ footer {
     font-size: 26px;
 }
 
+.alarm-card {
+    margin-bottom: 20px;
+    border: 1px solid #334155;
+}
+
+.alarm-card h3 {
+    margin-top: 0;
+}
+
+.alarm-status {
+    padding: 12px;
+    border-radius: 8px;
+    font-weight: bold;
+    background: #334155;
+}
+
+.alarm-status.normal {
+    background: #173c35;
+    color: #22c55e;
+}
+
+.alarm-status.active {
+    background: #451a1a;
+    color: #f87171;
+}
+
+.alarm-controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-top: 12px;
+}
+
+.alarm-controls input {
+    width: 100px;
+    padding: 12px;
+    border: 1px solid #475569;
+    border-radius: 8px;
+    background: #101827;
+    color: white;
+    font-size: 16px;
+}
+
+.alarm-controls button {
+    background: #2563eb;
+    color: white;
+    border: none;
+    border-radius: 8px;
+    padding: 12px 18px;
+    font-weight: bold;
+    cursor: pointer;
+}
+
+#alarmMessage {
+    font-size: 13px;
+    color: #94a3b8;
+}
+
 </style>
 </head>
 
@@ -519,6 +739,41 @@ footer {
   <button onclick="saveControl()">Apply settings</button>
 </div>
 
+<div class="sensor-card alarm-card">
+    <h3>Alarm Configuration</h3>
+
+    <div id="alarmStatus" class="alarm-status">
+        Checking alarm status...
+    </div>
+
+    <p id="alarmReason"></p>
+
+    <p>
+        Stored threshold:
+        <span id="storedAlarmThreshold">--</span> °C
+    </p>
+
+    <label for="alarmThreshold">
+        High-temperature alarm (°C)
+    </label>
+
+    <div class="alarm-controls">
+        <input id="alarmThreshold"
+               type="number"
+               min="15"
+               max="60"
+               step="0.1"
+               value="25">
+
+        <button id="saveAlarmButton"
+                onclick="saveAlarm()">
+            Save settings
+        </button>
+    </div>
+
+    <p id="alarmMessage"></p>
+</div>
+
 <div class="grid" id="relayGrid"></div>
 
 <div class="actions">
@@ -550,6 +805,103 @@ const message = document.getElementById("message");
 const connection = document.getElementById("connection");
 
 let currentMode = "manual";
+
+let alarmSettingsLoaded = false;
+
+function renderAlarm(alarm) {
+    if (!alarm) return;
+
+    const status =
+        document.getElementById("alarmStatus");
+
+    const reason =
+        document.getElementById("alarmReason");
+
+    document.getElementById(
+        "storedAlarmThreshold"
+    ).textContent = alarm.threshold.toFixed(1);
+
+    status.className = "alarm-status " +
+        (alarm.active ? "active" : "normal");
+
+    if (alarm.sensorFault) {
+        status.textContent = "SENSOR FAULT";
+        reason.textContent = "Buzzer alarm active";
+    } else if (alarm.highTemperature) {
+        status.textContent = "HIGH TEMPERATURE";
+        reason.textContent = "Buzzer alarm active";
+    } else {
+        status.textContent = "SYSTEM NORMAL";
+        reason.textContent = "Buzzer silent";
+    }
+
+    if (!alarmSettingsLoaded) {
+        document.getElementById(
+            "alarmThreshold"
+        ).value = alarm.threshold;
+
+        alarmSettingsLoaded = true;
+    }
+}
+
+async function saveAlarm() {
+    const input =
+        document.getElementById("alarmThreshold");
+
+    const msg =
+        document.getElementById("alarmMessage");
+
+    const button =
+        document.getElementById("saveAlarmButton");
+
+    const threshold = Number(input.value);
+
+    if (input.value.trim() === "" ||
+        !Number.isFinite(threshold) ||
+        threshold < 15 ||
+        threshold > 60) {
+        msg.textContent =
+            "Enter a temperature between 15 and 60°C.";
+
+        msg.style.color = "#f87171";
+        return;
+    }
+
+    button.disabled = true;
+
+    try {
+        const params = new URLSearchParams({
+            threshold: threshold.toString()
+        });
+
+        const data = await request("/api/alarm", {
+            method: "POST",
+            headers: {
+                "Content-Type":
+                    "application/x-www-form-urlencoded"
+            },
+            body: params.toString()
+        });
+
+        input.value = data.threshold;
+
+        renderAlarm(data);
+
+        msg.textContent =
+            "Alarm threshold saved successfully.";
+
+        msg.style.color = "#22c55e";
+
+    } catch (error) {
+        msg.textContent =
+            "Unable to save alarm settings.";
+
+        msg.style.color = "#f87171";
+
+    } finally {
+        button.disabled = false;
+    }
+}
 
 async function loadControl() {
     const data = await request("/api/control");
@@ -650,6 +1002,8 @@ async function refresh() {
         const data = await request("/api/status");
 
         states = data.relays;
+
+        renderAlarm(data.alarm);
 
         const sensor = data.sensor;
 
@@ -880,7 +1234,107 @@ void handleControl()
         : ControlMode::MANUAL;
 
     updateAutomaticControl();
+
+    if (!saveSettings())
+    {
+        sendJson(500,
+        "{\"error\":\"Unable to save settings\"}");
+        return;
+    }
+
     sendJson(200, controlJson());
+}
+
+String alarmJson()
+{
+    String json = "{\"threshold\":";
+
+    json += String(alarmThreshold, 1);
+
+    json += ",\"active\":";
+    json += alarmActive ? "true" : "false";
+
+    json += ",\"sensorFault\":";
+    json += alarmSensorFault ? "true" : "false";
+
+    json += ",\"highTemperature\":";
+    json += alarmHighTemperature ? "true" : "false";
+
+    json += "}";
+
+    return json;
+}
+
+void handleAlarm()
+{
+    if (server.method() == HTTP_GET)
+    {
+        sendJson(200, alarmJson());
+        return;
+    }
+
+    if (!server.hasArg("threshold"))
+    {
+        sendJson(400,
+            "{\"error\":\"Missing threshold\"}");
+        return;
+    }
+
+    String value = server.arg("threshold");
+    value.trim();
+
+    char* end = nullptr;
+
+    float threshold =
+        strtof(value.c_str(), &end);
+
+    if (value.isEmpty() ||
+        end == value.c_str() ||
+        *end != '\0' ||
+        !isfinite(threshold) ||
+        threshold < MIN_ALARM_THRESHOLD ||
+        threshold > MAX_ALARM_THRESHOLD)
+    {
+        sendJson(400,
+            "{\"error\":\"Invalid alarm threshold\"}");
+        return;
+    }
+
+    // Match the precision displayed in the UI.
+    threshold = roundf(threshold * 10.0f) / 10.0f;
+
+    if (threshold != alarmThreshold)
+    {
+        if (!preferences.begin("konceptux", false))
+        {
+            sendJson(500,
+                "{\"error\":\"NVS initialization failed\"}");
+            return;
+        }
+
+        bool saved = preferences.putFloat(
+            "alarmTemp", threshold) > 0;
+
+        preferences.end();
+
+        if (!saved)
+        {
+            sendJson(500,
+                "{\"error\":\"Unable to save threshold\"}");
+            return;
+        }
+
+        alarmThreshold = threshold;
+
+        Serial.printf(
+            "Alarm threshold saved: %.1f C\n",
+            alarmThreshold
+        );
+    }
+
+    updateAlarm();
+
+    sendJson(200, alarmJson());
 }
 
 void setupWebServer()
@@ -897,10 +1351,11 @@ void setupWebServer()
     server.on("/api/all", HTTP_POST, handleAll);
     server.on("/api/control", HTTP_GET, handleControl);
     server.on("/api/control", HTTP_POST, handleControl);
+    server.on("/api/alarm", HTTP_GET, handleAlarm);
+    server.on("/api/alarm", HTTP_POST, handleAlarm);
     server.onNotFound([]() {
         sendJson(404, "{\"error\":\"Not found\"}");
     });
-
     server.begin();
     Serial.println("HTTP server started");
 }
@@ -1027,6 +1482,32 @@ void drawOledPage()
             );
             break;
         }
+
+    case 3:
+        oled.drawStr(0, 8, "ALARM");
+
+        snprintf(line, sizeof(line),
+             "LIM: %.1f C", alarmThreshold);
+
+        oled.drawStr(0, 20, line);
+
+        if (!alarmSensorFault)
+        {
+            snprintf(line, sizeof(line),
+                 "T: %.1f C", temperatureC);
+
+            oled.drawStr(0, 32, line);
+        }
+
+        oled.drawStr(
+        0, 44,
+        alarmSensorFault ? "SENSOR ERR" :
+        alarmHighTemperature ? "HIGH TEMP" :
+        "NORMAL"
+        );
+
+    break;
+
     }
 
     oled.sendBuffer();
@@ -1043,7 +1524,7 @@ void updateOled()
     if (now - lastOledPageChange >= OLED_PAGE_MS)
     {
         lastOledPageChange = now;
-        oledPage = (oledPage + 1) % 3;
+        oledPage = (oledPage + 1) % 4;
     }
 
     if (now - lastOledRefresh >= OLED_REFRESH_MS)
@@ -1081,7 +1562,8 @@ void setup()
     buttonStableState = digitalRead(BUTTON_PIN);
     buttonLastReading = buttonStableState;
     buttonLastChange = millis();
-
+    initBuzzer();
+    loadSettings();
     initSensor();
     initOled();
     Serial.println("\nKonceptux Relay16");
@@ -1125,6 +1607,7 @@ void loop()
     handleButton();
     updateSensor();
     updateAutomaticControl();
+    updateAlarm();
     updateOled();
     if (WiFi.status() == WL_CONNECTED)
     {
